@@ -1,0 +1,89 @@
+name: Verify terminal wrapping
+on:
+  push:
+    branches: [verify-terminal-wrapping]
+    paths: ['.github/workflows/verify-terminal-wrapping.yml']
+permissions:
+  contents: read
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Render the same six-column Ratatui screen before and after
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          root = Path("src-tauri/src/core/cli/tui/markdown.rs")
+          def implementation(text):
+              start = text.index("pub(super) fn wrap_spans_at_words(")
+              end = text.index("/// Heading ladder.", start)
+              return text[start:end]
+          base = subprocess.check_output(["git", "show", "49a84bdeaebdfc0f36c00f252eb638f516a48432:" + str(root)], text=True)
+          fixed = root.read_text()
+          folder = Path("/tmp/jan-wrap")
+          (folder / "src").mkdir(parents=True, exist_ok=True)
+          import tomllib
+          lock = tomllib.loads(Path("src-tauri/Cargo.lock").read_text())["package"]
+          def version(name, prefix):
+              return next(x["version"] for x in lock if x["name"] == name and x["version"].startswith(prefix))
+          (folder / "Cargo.toml").write_text('[package]\nname="verify-wrap"\nversion="0.0.1"\nedition="2021"\n[dependencies]\nratatui="=' + version("ratatui","0.30") + '"\nunicode-segmentation="=' + version("unicode-segmentation","1.") + '"\n')
+          for name, src in [("before",base),("after",fixed)]:
+              (folder / "src" / (name + ".rs")).write_text("use ratatui::prelude::*;\n" + implementation(src))
+          PY
+          cat > /tmp/jan-wrap/src/main.rs <<'RS'
+          use ratatui::{backend::TestBackend, prelude::*, widgets::Paragraph, Terminal};
+          mod before;
+          mod after;
+          type Wrapper = fn(Vec<Span<'static>>, usize) -> Vec<Vec<Span<'static>>>;
+          
+          fn screen(wrap: Wrapper) -> Vec<String> {
+              let spans = vec![Span::raw("中文"), Span::styled("测试", Style::new().bold()), Span::raw("结束")];
+              let lines: Vec<_> = wrap(spans, 4).into_iter().enumerate().map(|(i, mut spans)| {
+                  spans.insert(0, Span::raw(if i == 0 { "• " } else { "  " }));
+                  Line::from(spans)
+              }).collect();
+              let mut terminal = Terminal::new(TestBackend::new(6, 3)).unwrap();
+              terminal.draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area())).unwrap();
+              let buf = terminal.backend().buffer();
+              (0..3).map(|y| {
+                  let mut s = String::new();
+                  let mut x = 0;
+                  while x < 6 {
+                      use ratatui::buffer::CellWidth;
+                      let symbol = buf[(x, y)].symbol();
+                      s.push_str(symbol);
+                      x += symbol.cell_width().max(1) as u16;
+                  }
+                  s.trim_end().to_string()
+              }).collect()
+          }
+          fn main() {
+              let before = screen(before::wrap_spans_at_words);
+              let after = screen(after::wrap_spans_at_words);
+              println!("BASE_SCREEN {before:?}\nFIXED_SCREEN {after:?}");
+              assert_ne!(before, after);
+              assert_eq!(after, ["• 中文", "  测试", "  结束"]);
+              let rows = after::wrap_spans_at_words(vec![Span::raw("e\u{301}👩‍💻文")], 1);
+              let text: Vec<_> = rows.into_iter().map(|r| Line::from(r).to_string()).collect();
+              assert_eq!(text, ["e\u{301}", "👩‍💻", "文"]);
+          }
+          RS
+          cargo run --quiet --manifest-path /tmp/jan-wrap/Cargo.toml
+  markdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run the CLI markdown tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features cli --lib -- core::cli::tui::markdown::tests
